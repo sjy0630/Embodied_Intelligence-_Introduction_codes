@@ -1,178 +1,240 @@
-import sherpa_onnx
-from sherpa_onnx import OfflineRecognizer
-from typing import Union
-import librosa
 import sounddevice as sd
 import numpy as np
 import requests
 import json
+import time
+import os
+import sys
+# 引入 FunASR (SenseVoiceSmall)
+from funasr import AutoModel
+# 引入 sherpa_onnx (仅用于 VAD 断句)
+from sherpa_onnx import VadModelConfig, SileroVadModelConfig, VoiceActivityDetector
 
+# ================= 配置区 =================
+# 1. 模型路径
+# (请确保你的 model/VAD/silero_vad.onnx 文件存在)
+vad_path = 'model/VAD' 
 
-asr_path = 'model/ASR/sherpa-onnx-paraformer-zh-small-2024-03-09'
-vad_path = 'model/VAD'
+# 2. 小车 IP 地址 (请修改为你树莓派的实际 IP)
+control_url = "http://10.207.27.17:5000/control" 
 
-def get_command(text: str) -> str:
-    url = "https://api.siliconflow.cn/v1/chat/completions"
+# 3. DeepSeek API 配置
+API_KEY = "sk-82c484322c3f452fb8b54858ad1cc54f"
+API_URL = "https://api.deepseek.com/chat/completions"
+MODEL_NAME = "deepseek-chat"
+# ==========================================
 
+# HTTP Session (保持长连接，减少延迟)
+session = requests.Session()
+session.headers.update({
+    "Authorization": f"Bearer {API_KEY}",
+    "Content-Type": "application/json"
+})
+
+# 全局状态记忆 (用于处理 "加速" 这种不带方向的指令)
+last_command_state = {"command": "STOP", "steer": 0.0, "throttle": 0.0}
+
+# --- 1. 初始化 SenseVoiceSmall 模型 ---
+print("正在加载 SenseVoiceSmall 模型 (首次运行会自动下载，约500MB)...")
+try:
+    # device="cuda" 如果有N卡建议用 cuda，没有则用 cpu
+    asr_model = AutoModel(
+        model="iic/SenseVoiceSmall",
+        device="cuda" if np.mod(1,1)==0 else "cpu", 
+        disable_update=True,
+        log_level="ERROR"
+    )
+    print("✅ SenseVoiceSmall 加载完成！")
+except Exception as e:
+    print(f"❌ ASR 模型加载失败: {e}")
+    print("请确保已安装: pip install funasr modelscope torch")
+    exit()
+
+# --- 2. 初始化 VAD ---
+try:
+    config = VadModelConfig(
+        SileroVadModelConfig(
+            model=f'{vad_path}/silero_vad.onnx',
+            min_silence_duration=0.5, # 0.5秒静音视为一句话结束
+            threshold=0.5
+        ),
+        sample_rate=16000
+    )
+    vad = VoiceActivityDetector(config, buffer_size_in_seconds=100)
+except Exception as e:
+    print(f"❌ VAD 加载失败: {e}")
+    print(f"请检查路径: {vad_path}/silero_vad.onnx")
+    exit()
+
+# --- 3. System Prompt (慢速安全版) ---
+SYSTEM_PROMPT = """
+你是一个智能小车的控制大脑。请将用户的口语指令转换为 JSON 控制信号。
+
+### 接口定义
+1. command: ["FORWARD", "BACKWARD", "STOP"]
+   - FORWARD: 前进 或 转向
+   - BACKWARD: 后退
+   - STOP: 停止
+2. steer: 浮点数 -1.0(最左) 到 1.0(最右)。0.0(直)。
+   - "左转": -1.0
+   - "左转一点点/微调": -0.3
+   - "右转": 1.0
+3. throttle: 0.0 到 1.0 (速度)。
+   - "慢/一点点": 0.15 - 0.2 (非常慢)
+   - "正常": 0.35 (安全速度)
+   - "快/加速": 0.6 (不要太快)
+
+### 规则
+1. "停", "别动" -> STOP。
+2. "不要左转" (否定) -> STOP。
+3. 输出 JSON。
+
+示例: {"command": "FORWARD", "steer": 0.0, "throttle": 0.35}
+"""
+
+def parse_local_fast(text: str):
+    """
+    本地快速解析 (已调整为慢速参数)
+    """
+    global last_command_state
+    
+    # 1. 紧急停止
+    if any(w in text for w in ["停", "刹车", "别动", "stop"]):
+        return {"command": "STOP", "steer": 0.0, "throttle": 0.0}
+
+    # 2. 识别方向
+    new_cmd = "FORWARD" 
+    if "后" in text or "退" in text: new_cmd = "BACKWARD"
+    
+    # 3. 识别转向
+    new_steer = 0.0
+    if "左" in text: new_steer = -1.0
+    elif "右" in text: new_steer = 1.0
+
+    # 4. 识别速度 (默认慢速)
+    new_throttle = 0.35 
+    if any(w in text for w in ["慢", "缓", "小", "微"]): 
+        new_throttle = 0.2
+    elif any(w in text for w in ["快", "速", "冲", "急"]): 
+        new_throttle = 0.6
+
+    # 5. 处理纯速度/方向指令 (继承逻辑)
+    has_direction = any(w in text for w in ["前", "后", "左", "右", "走", "退"])
+    if not has_direction:
+        # 如果没说方向，继承上一次的前后状态
+        if last_command_state['command'] == "BACKWARD": new_cmd = "BACKWARD"
+        else: new_cmd = "FORWARD"
+        new_steer = 0.0 # 纯加速时默认回正，防止画圈
+    
+    return {"command": new_cmd, "steer": new_steer, "throttle": new_throttle}
+
+def get_command_from_llm(text: str) -> dict:
+    """调用 DeepSeek API"""
     payload = {
-        "model": "Qwen/QwQ-32B",
+        "model": MODEL_NAME,
         "messages": [
-            {
-                "role": "user",
-                "content": f"你是一辆小车，现在你的任务是“{text}”，你可选择的动作有“前进、后退、左转、右转、无操作”，你只需要回答下一步你会做的动作即可，你的选择是："
-            }
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": text}
         ],
         "stream": False,
-        "max_tokens": 512,
-        "enable_thinking": False,
-        "thinking_budget": 512,
-        "min_p": 0.05,
-        "stop": None,
-        "temperature": 0.7,
-        "top_p": 0.7,
-        "top_k": 50,
-        "frequency_penalty": 0.5,
-        "n": 1,
-        "response_format": {"type": "text"},
-        "tools": [
-            {
-                "type": "function",
-                "function": {
-                    "description": "<string>",
-                    "name": "<string>",
-                    "parameters": {},
-                    "strict": False
-                }
-            }
-        ]
+        "temperature": 0.1, 
+        "response_format": {"type": "json_object"} 
     }
-    headers = {
-        "Authorization": "Bearer sk-oboumgsutddcwgewajpsslapvhxlbejhjrfbcmndhmnmmxla",
-        "Content-Type": "application/json"
-    }
+    
+    print(f"🤖 DeepSeek 思考: '{text}' ...")
     try:
-        response = requests.request("POST", url, json=payload, headers=headers)
-        r_content = json.loads(response.text)['choices'][0]['message']['content'].strip()
-        r_reason = json.loads(response.text)['choices'][0]['message']['reasoning_content'].strip()
-
-        print('大模型回复：', r_content)
-        print('大模型推理过程：', r_reason)
-        command_list = ['前进', '后退', '左转', '右转', '无操作']
-        rfind_idx_list = [
-            r_content.rfind(command) for command in command_list
-        ]
-        max_idx = np.argmax(rfind_idx_list)
-        if rfind_idx_list[max_idx] == -1:
-            return '无操作'
-        command = command_list[max_idx]
-    except Exception as e:
-        print('大模型请求失败：', e)
-        command = '无操作'
-    return command
-
-class ASR:
-    def __init__(self):
-        self._recognizer = OfflineRecognizer()
-        raise NotImplementedError
-
-    def transcribe(self, audio: Union[str, np.ndarray], sample_rate=16000) -> str:
-        if isinstance(audio, str):
-            audio, _ = librosa.load(audio, sr=sample_rate)
-        s = self._recognizer.create_stream()
-        s.accept_waveform(sample_rate, audio)
-        self._recognizer.decode_stream(s)
-        return s.result.text
-
-
-class Whisper(ASR):
-    def __init__(self, encoder_path: str, decoder_path: str, tokens_path: str, num_threads: int = 8, provider: str = 'cpu'):
-        self._recognizer = sherpa_onnx.OfflineRecognizer.from_whisper(
-            encoder=encoder_path,
-            decoder=decoder_path,
-            tokens=tokens_path,
-            num_threads=num_threads,
-            provider=provider,
-        )
-
-
-class Paraformer(ASR):
-    def __init__(self, model_path: str, tokens_path: str, num_threads: int = 8, provider: str = 'cpu'):
-        self._recognizer = sherpa_onnx.OfflineRecognizer.from_paraformer(
-            paraformer=model_path,
-            tokens=tokens_path,
-            num_threads=num_threads,
-            provider=provider,
-        )
-
-print('正在加载ASR模型...')
-asr = Paraformer(
-    model_path=f'{asr_path}/model.int8.onnx',
-    tokens_path=f'{asr_path}/tokens.txt',
-    # provider='cuda',
-)
-
-sample_rate = 16000
-
-from sherpa_onnx import VadModelConfig, SileroVadModelConfig, VoiceActivityDetector
-config = VadModelConfig(
-    SileroVadModelConfig(
-        model=f'{vad_path}/silero_vad.onnx',
-        min_silence_duration=0.25,
-    ),
-    sample_rate=sample_rate
-)
-window_size = config.silero_vad.window_size
-vad = VoiceActivityDetector(config, buffer_size_in_seconds=100)
-samples_per_read = int(0.1 * sample_rate)
-
-control_url = "http://192.168.192.123:5000/control"  
-
-def send_command(text):
-    try:
-        if '前进' == text:
-            response = requests.post(control_url, json={'command': "FORWARD"})
-        elif '后退' == text:
-            response = requests.post(control_url, json={'command': "STOP"})
-        elif '左转' == text:
-            response = requests.post(control_url, json={'command': "LEFT"})
-        elif '右转' in text:
-            response = requests.post(control_url, json={'command': "RIGHT"})
-        else:
-            response = requests.post(control_url, json={'command': "STOP"})
-
+        response = session.post(API_URL, json=payload, timeout=3)
         if response.status_code != 200:
-            print('小车指令请求失败：', response)
+            print(f"⚠️ API 错误: {response.text}")
+            return None
+        
+        # [修复] 之前这里被截断了，现在补全了逻辑
+        r = response.json()['choices'][0]['message']['content'].strip()
+        if "```" in r: 
+            r = r.replace("```json", "").replace("```", "")
+        
+        return json.loads(r)
     except Exception as e:
-        print('小车指令请求异常：', e)
+        print(f"❌ LLM 失败: {e}")
+        return None
 
-print('\n正在识别语音指令...')
-idx = 1
-buffer = []
+def send_to_car(json_cmd):
+    """发送指令给树莓派"""
+    global last_command_state
+    if not json_cmd: return
+    
+    last_command_state = json_cmd
+    
+    # 打印进度条
+    spd = json_cmd.get('throttle', 0)
+    spd_bar = "█" * int(spd * 20)
+    print(f"🚀 发送: {json_cmd['command']} | 转向:{json_cmd.get('steer')} | 速度:{spd:.2f} {spd_bar}")
+    
+    try:
+        requests.post(control_url, json=json_cmd, timeout=1)
+    except Exception as e:
+        print(f"通信错误: {e}")
+
+# --- 主循环 ---
+print('\n🎙️ 高精度语音控制 (SenseVoice + DeepSeek) 已启动... (Ctrl+C 退出)')
+sample_rate = 16000
+samples_per_read = int(0.1 * sample_rate) 
+
 try:
     with sd.InputStream(channels=1, dtype="float32", samplerate=sample_rate) as s:
         while True:
-            samples, _ = s.read(samples_per_read)  # a blocking read
+            samples, _ = s.read(samples_per_read)
             samples = samples.reshape(-1)
-
-            buffer = np.concatenate([buffer, samples])
-            while len(buffer) > window_size:
-                vad.accept_waveform(buffer[:window_size])
-                buffer = buffer[window_size:]
-
-            while not vad.empty():
-                text = asr.transcribe(vad.front.samples, sample_rate=sample_rate)
-
+            
+            # VAD 断句
+            vad.accept_waveform(samples)
+            
+            if not vad.empty():
+                # [Fix] 确保转换为 numpy array
+                audio_segment = np.array(vad.front.samples)
                 vad.pop()
-                if len(text):
-                    print()
-                    print(f'第{idx}句：{text}')
-                    command = get_command(text)
-                    if command == '无操作':
-                        print('未识别到小车指令')
-                    else:
-                        print('识别到小车指令：', command)
-                        send_command(command)
-                    idx += 1
+                
+                # SenseVoice 识别
+                if len(audio_segment) > 0:
+                    try:
+                        res = asr_model.generate(
+                            input=[audio_segment], # [Fix] 加上 [] 包装成 list，防止 funasr 把 1D 数组当成 batch 遍历导致 float 报错
+                            cache={}, 
+                            language="zh", 
+                            use_itn=True,
+                            batch_size_s=60
+                        )
+                        
+                        text = ""
+                        if isinstance(res, list) and len(res) > 0:
+                            text = res[0].get("text", "")
+                        
+                        import re
+                        text = re.sub(r'<\|.*?\|>', '', text).strip()
+
+                        if len(text) > 0:
+                            print(f"\n👂 听到: {text}")
+                            
+                            # 1. 尝试本地解析 (为了快)
+                            cmd = parse_local_fast(text)
+                            
+                            # 2. 如果是复杂句 (否定/长句)，交给 LLM
+                            if "不" in text or "别" in text or len(text) > 5:
+                                llm_cmd = get_command_from_llm(text)
+                                if llm_cmd: cmd = llm_cmd
+                            
+                            if cmd: send_to_car(cmd)
+                            
+                    except Exception as e:
+                        print(f"识别出错: {e}")
+
 except KeyboardInterrupt:
-    sd.stop()
-    print('\n识别结束')
+    print('\n程序被用户中断')
+
+finally:
+    # 安全退出：强制停车
+    print("\n🛑 正在强制停止小车...")
+    for _ in range(3):
+        send_to_car({"command": "STOP", "steer": 0.0, "throttle": 0.0})
+        time.sleep(0.1)
+    print("程序已安全退出。")

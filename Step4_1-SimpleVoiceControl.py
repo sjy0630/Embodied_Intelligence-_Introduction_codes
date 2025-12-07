@@ -66,7 +66,7 @@ window_size = config.silero_vad.window_size
 vad = VoiceActivityDetector(config, buffer_size_in_seconds=100)
 samples_per_read = int(0.1 * sample_rate)
 
-control_url = "http://192.168.192.123:5000/control"  
+control_url = "http://10.207.27.17:5000/control"
 
 def send_command(text):
     try:

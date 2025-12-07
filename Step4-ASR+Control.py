@@ -6,7 +6,7 @@ import sounddevice as sd
 import numpy as np
 import requests
 
-
+# ！！！--- 请确认你的模型路径是否正确 ---！！！
 asr_path = 'model/ASR/sherpa-onnx-paraformer-zh-small-2024-03-09'
 vad_path = 'model/VAD'
 
@@ -45,12 +45,18 @@ class Paraformer(ASR):
         )
 
 print('正在加载模型...')
-asr = Paraformer(
-    model_path=f'{asr_path}/model.int8.onnx',
-    tokens_path=f'{asr_path}/tokens.txt',
-    # provider='cuda',
-)
-print('模型加载完成')
+# 请确保你的模型文件夹里确实有这些文件
+try:
+    asr = Paraformer(
+        model_path=f'{asr_path}/model.int8.onnx',
+        tokens_path=f'{asr_path}/tokens.txt',
+        # provider='cuda', # 如果有显卡可以取消注释
+    )
+    print('模型加载完成')
+except Exception as e:
+    print(f"模型加载失败: {e}")
+    print("请检查 asr_path 和 vad_path 变量是否指向了正确的文件夹")
+    exit()
 
 sample_rate = 16000
 
@@ -66,24 +72,63 @@ window_size = config.silero_vad.window_size
 vad = VoiceActivityDetector(config, buffer_size_in_seconds=100)
 samples_per_read = int(0.1 * sample_rate)
 
-control_url = "http://192.168.192.123:5000/control"  
+# ！！！--- 请确认这里的 IP 地址 ---！！！
+# 你之前的视觉代码用的是 192.168.87.17，这里你贴的是 10.207.27.17
+# 请根据实际情况修改！
+control_url = "http://10.207.27.17:5000/control" 
 
 def send_command(text):
     global control_url
-    ##TODO
+    
+    # 默认指令
+    command = "STOP"
+    steer = 0.0
+    
+    # --- 核心修改：适配新的 steer 控制逻辑 ---
     if '左' in text:
-        response = requests.post(control_url, json={'command': "LEFT"})
+        # 左转：发送 FORWARD，并将 steer 设为 -1.0 (最大左转/原地左转)
+        command = "FORWARD"
+        steer = -1.0 
+        print(f"识别到'左' -> 左转 (Steer: {steer})")
+        
     elif '右' in text:
-        response = requests.post(control_url, json={'command': "RIGHT"})
-    elif '前' in text:
-        response = requests.post(control_url, json={'command': "FORWARD"})
+        # 右转：发送 FORWARD，并将 steer 设为 1.0 (最大右转/原地右转)
+        command = "FORWARD"
+        steer = 1.0
+        print(f"识别到'右' -> 右转 (Steer: {steer})")
+        
+    elif '前' in text or '走' in text:
+        # 前进：发送 FORWARD，steer 为 0.0 (直行)
+        command = "FORWARD"
+        steer = 0.0
+        print(f"识别到'前' -> 前进")
+        
+    elif '后' in text or '退' in text:
+        # 后退：发送 BACKWARD (树莓派代码里保留了对 BACKWARD 的支持)
+        command = "BACKWARD"
+        steer = 0.0
+        print(f"识别到'后' -> 后退")
+        
     elif '停' in text:
-        response = requests.post(control_url, json={'command': "STOP"})
+        command = "STOP"
+        steer = 0.0
+        print(f"识别到'停' -> 停止")
+        
     else:
-        response = requests.post(control_url, json={'command': "STOP"})
-    ##TODO
+        # 未识别出有效指令，默认停止或忽略
+        # command = "STOP"
+        print(f"未识别指令，忽略")
+        return # 不发送请求
 
-print('正在识别音频...')
+    # 发送请求
+    try:
+        # 现在的树莓派服务器需要 'steer' 参数
+        response = requests.post(control_url, json={'command': command, 'steer': steer})
+        # print(response.text)
+    except requests.exceptions.RequestException as e:
+        print(f"指令发送失败: {e}")
+
+print('正在识别音频... (按 Ctrl+C 退出)')
 idx = 1
 buffer = []
 try:
@@ -102,7 +147,6 @@ try:
 
                 vad.pop()
                 if len(text):
-                    print()
                     print(f'第{idx}句：{text}')
                     send_command(text)
                     idx += 1
